@@ -14,6 +14,7 @@
 #include <X11/keysym.h>
 #include <X11/Xft/Xft.h>
 #include <X11/XKBlib.h>
+#include <X11/Xresource.h>
 
 char *argv0;
 #include "arg.h"
@@ -94,6 +95,7 @@ typedef struct {
 	Drawable buf;
 	GlyphFontSpec *specbuf; /* font spec buffer used for rendering */
 	Atom xembed, wmdeletewin, netwmname, netwmiconname, netwmpid;
+	Atom netwmstate, netwmfullscreen;
 	struct {
 		XIM xim;
 		XIC xic;
@@ -103,6 +105,11 @@ typedef struct {
 	Draw draw;
 	Visual *vis;
 	XSetWindowAttributes attrs;
+	/* Here, we use the term *pointer* to differentiate the cursor
+	 * one sees when hovering the mouse over the terminal from, e.g.,
+	 * a green rectangle where text would be entered. */
+	Cursor vpointer, bpointer; /* visible and hidden pointers */
+	int pointerisvisible;
 	int scr;
 	int isfixed; /* is fixed geometry? */
 	int l, t; /* left and top offset */
@@ -686,6 +693,7 @@ setsel(char *str, Time t)
 	XSetSelectionOwner(xw.dpy, XA_PRIMARY, xw.win, t);
 	if (XGetSelectionOwner(xw.dpy, XA_PRIMARY) != xw.win)
 		selclear();
+	clipcopy(NULL);
 }
 
 void
@@ -716,6 +724,13 @@ brelease(XEvent *e)
 void
 bmotion(XEvent *e)
 {
+	if (!xw.pointerisvisible) {
+		XDefineCursor(xw.dpy, xw.win, xw.vpointer);
+		xw.pointerisvisible = 1;
+		if (!IS_SET(MODE_MOUSEMANY))
+			xsetpointermotion(0);
+	}
+
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
 		return;
@@ -758,6 +773,24 @@ xresize(int col, int row)
 
 	/* resize to new width */
 	xw.specbuf = xrealloc(xw.specbuf, col * sizeof(GlyphFontSpec));
+}
+
+void
+fullscreen(const Arg *arg)
+{
+	XEvent ev;
+
+	memset(&ev, 0, sizeof(ev));
+
+	ev.xclient.type = ClientMessage;
+	ev.xclient.message_type = xw.netwmstate;
+	ev.xclient.display = xw.dpy;
+	ev.xclient.window = xw.win;
+	ev.xclient.format = 32;
+	ev.xclient.data.l[0] = 2; /* _NET_WM_STATE_TOGGLE */
+	ev.xclient.data.l[1] = xw.netwmfullscreen;
+
+	XSendEvent(xw.dpy, DefaultRootWindow(xw.dpy), False, SubstructureNotifyMask|SubstructureRedirectMask, &ev);
 }
 
 ushort
@@ -1130,10 +1163,10 @@ void
 xinit(int cols, int rows)
 {
 	XGCValues gcvalues;
-	Cursor cursor;
 	Window parent;
 	pid_t thispid = getpid();
 	XColor xmousefg, xmousebg;
+	Pixmap blankpm;
 
 	if (!(xw.dpy = XOpenDisplay(NULL)))
 		die("can't open display\n");
@@ -1197,8 +1230,9 @@ xinit(int cols, int rows)
 	}
 
 	/* white cursor, black outline */
-	cursor = XCreateFontCursor(xw.dpy, mouseshape);
-	XDefineCursor(xw.dpy, xw.win, cursor);
+	xw.pointerisvisible = 1;
+	xw.vpointer = XCreateFontCursor(xw.dpy, mouseshape);
+	XDefineCursor(xw.dpy, xw.win, xw.vpointer);
 
 	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
 		xmousefg.red   = 0xffff;
@@ -1212,7 +1246,10 @@ xinit(int cols, int rows)
 		xmousebg.blue  = 0x0000;
 	}
 
-	XRecolorCursor(xw.dpy, cursor, &xmousefg, &xmousebg);
+	XRecolorCursor(xw.dpy, xw.vpointer, &xmousefg, &xmousebg);
+	blankpm = XCreateBitmapFromData(xw.dpy, xw.win, &(char){0}, 1, 1);
+	xw.bpointer = XCreatePixmapCursor(xw.dpy, blankpm, blankpm,
+					  &xmousefg, &xmousebg, 0, 0);
 
 	xw.xembed = XInternAtom(xw.dpy, "_XEMBED", False);
 	xw.wmdeletewin = XInternAtom(xw.dpy, "WM_DELETE_WINDOW", False);
@@ -1223,6 +1260,9 @@ xinit(int cols, int rows)
 	xw.netwmpid = XInternAtom(xw.dpy, "_NET_WM_PID", False);
 	XChangeProperty(xw.dpy, xw.win, xw.netwmpid, XA_CARDINAL, 32,
 			PropModeReplace, (uchar *)&thispid, 1);
+
+	xw.netwmstate = XInternAtom(xw.dpy, "_NET_WM_STATE", False);
+	xw.netwmfullscreen = XInternAtom(xw.dpy, "_NET_WM_STATE_FULLSCREEN", False);
 
 	win.mode = MODE_NUMLOCK;
 	resettitle();
@@ -1721,6 +1761,8 @@ unmap(XEvent *ev)
 void
 xsetpointermotion(int set)
 {
+	if (!set && !xw.pointerisvisible)
+		return;
 	MODBIT(xw.attrs.event_mask, set, PointerMotionMask);
 	XChangeWindowAttributes(xw.dpy, xw.win, CWEventMask, &xw.attrs);
 }
@@ -1839,6 +1881,12 @@ kpress(XEvent *ev)
 	Rune c;
 	Status status;
 	Shortcut *bp;
+
+	if (xw.pointerisvisible) {
+		XDefineCursor(xw.dpy, xw.win, xw.bpointer);
+		xsetpointermotion(1);
+		xw.pointerisvisible = 0;
+	}
 
 	if (IS_SET(MODE_KBDLOCK))
 		return;
@@ -2014,6 +2062,118 @@ run(void)
 	}
 }
 
+
+#define XRESOURCE_LOAD_META(NAME)					\
+	if(!XrmGetResource(xrdb, "st." NAME, "st." NAME, &type, &ret))	\
+		XrmGetResource(xrdb, "*." NAME, "*." NAME, &type, &ret); \
+	if (ret.addr != NULL && !strncmp("String", type, 64))
+
+#define XRESOURCE_LOAD_STRING(NAME, DST)	\
+	XRESOURCE_LOAD_META(NAME)		\
+		DST = ret.addr;
+
+#define XRESOURCE_LOAD_CHAR(NAME, DST)		\
+	XRESOURCE_LOAD_META(NAME)		\
+		DST = ret.addr[0];
+
+#define XRESOURCE_LOAD_INTEGER(NAME, DST)		\
+	XRESOURCE_LOAD_META(NAME)			\
+		DST = strtoul(ret.addr, NULL, 10);
+
+#define XRESOURCE_LOAD_FLOAT(NAME, DST)		\
+	XRESOURCE_LOAD_META(NAME)		\
+		DST = strtof(ret.addr, NULL);
+
+void
+xrdb_load(void)
+{
+	/* XXX */
+	char *xrm;
+	char *type;
+	XrmDatabase xrdb;
+	XrmValue ret;
+	Display *dpy;
+
+	if(!(dpy = XOpenDisplay(NULL)))
+		die("Can't open display\n");
+
+	XrmInitialize();
+	xrm = XResourceManagerString(dpy);
+
+	if (xrm != NULL) {
+		xrdb = XrmGetStringDatabase(xrm);
+
+		/* handling colors here without macros to do via loop. */
+		int i = 0;
+		char loadValue[12] = "";
+		for (i = 0; i < 256; i++)
+		{
+			sprintf(loadValue, "%s%d", "st.color", i);
+
+			if(!XrmGetResource(xrdb, loadValue, loadValue, &type, &ret))
+			{
+				sprintf(loadValue, "%s%d", "*.color", i);
+				if (!XrmGetResource(xrdb, loadValue, loadValue, &type, &ret))
+					/* reset if not found (unless in range for defaults). */
+					if (i > 15)
+						colorname[i] = NULL;
+			}
+
+			if (ret.addr != NULL && !strncmp("String", type, 64))
+				colorname[i] = ret.addr;
+		}
+
+		XRESOURCE_LOAD_STRING("foreground", colorname[defaultfg]);
+		XRESOURCE_LOAD_STRING("background", colorname[defaultbg]);
+		XRESOURCE_LOAD_STRING("cursorColor", colorname[defaultcs])
+		else {
+		  // this looks confusing because we are chaining off of the if
+		  // in the macro. probably we should be wrapping everything blocks
+		  // so this isn't possible...
+		  defaultcs = defaultfg;
+		}
+		XRESOURCE_LOAD_STRING("reverse-cursor", colorname[defaultrcs])
+		else {
+		  // see above.
+		  defaultrcs = defaultbg;
+		}
+
+		XRESOURCE_LOAD_STRING("font", font);
+		XRESOURCE_LOAD_STRING("termname", termname);
+
+		XRESOURCE_LOAD_INTEGER("blinktimeout", blinktimeout);
+		XRESOURCE_LOAD_INTEGER("bellvolume", bellvolume);
+		XRESOURCE_LOAD_INTEGER("borderpx", borderpx);
+		XRESOURCE_LOAD_INTEGER("cursorshape", cursorshape);
+
+		XRESOURCE_LOAD_FLOAT("cwscale", cwscale);
+		XRESOURCE_LOAD_FLOAT("chscale", chscale);
+	}
+	XFlush(dpy);
+}
+
+void
+reload(int sig)
+{
+	xrdb_load();
+
+	/* colors, fonts */
+	xloadcols();
+	xunloadfonts();
+	xloadfonts(font, 0);
+
+	/* pretend the window just got resized */
+	cresize(win.w, win.h);
+
+	redraw();
+
+	/* triggers re-render if we're visible. */
+	ttywrite("\033[O", 3, 1);
+
+	signal(SIGUSR1, reload);
+}
+
+
 void
 usage(void)
 {
@@ -2087,6 +2247,8 @@ run:
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
+	xrdb_load();
+	signal(SIGUSR1, reload);
 	cols = MAX(cols, 1);
 	rows = MAX(rows, 1);
 	tnew(cols, rows);
